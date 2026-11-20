@@ -1,8 +1,25 @@
-import os
-import gc
+"""ASR：阿里百炼 Paraformer 录音文件识别（云端转写 + 云端说话人分离）。
+
+替代原来的 WhisperX（faster-whisper + 词级对齐 + pyannote 分离）本地链路：
+- 抽音频：ffmpeg → 16kHz 单声道 wav（paraformer 分离要求单声道）
+- 上传：dashscope 临时 OSS（OssUtils.upload），拿 oss:// URL
+- 转写：Transcription.async_call + 轮询，diarization_enabled 出句级 speaker_id
+- 落盘：transcript JSON + SRT，格式与旧版一致，下游零改动
+
+每个 segment 多出 `speaker` 字段（SPEAKER_00/01…，由云端 speaker_id 映射），
+向后兼容旧的 {start,end,text} 结构。
+"""
 import json
+import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
+
+from media import run_ffmpeg
+
+_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+               "all_proxy", "ALL_PROXY")
 
 
 def seconds_to_srt_time(seconds: float) -> str:
@@ -13,136 +30,30 @@ def seconds_to_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def _patch_torch_load():
-    """torch 2.6+ 把 torch.load 的 weights_only 默认改成 True，会导致
-    whisperx VAD / pyannote 的官方 checkpoint(含 omegaconf 对象)加载失败。
-    这些权重来自可信官方仓库，全局放开 weights_only=False。幂等。"""
-    import torch
-    if getattr(torch.load, "_wo_patched", False):
-        return
-    _orig = torch.load
-
-    def _patched(*args, **kwargs):
-        # 强制覆盖：lightning/pyannote 会显式传 weights_only=None/True，
-        # setdefault 无效，必须直接赋值。
-        kwargs["weights_only"] = False
-        return _orig(*args, **kwargs)
-
-    _patched._wo_patched = True
-    torch.load = _patched
-
-
-def _preload_cudnn():
-    """ctranslate2(faster-whisper 后端)需要在进程里找到 cuDNN 9 / cuBLAS。
-    torch 已把它们装在 site-packages/nvidia/*/lib 下，但不在默认链接路径，
-    且 torch 以 RTLD_LOCAL 加载、符号不全局。这里用 RTLD_GLOBAL 显式预加载，
-    让 ct2 能解析到 cuDNN 符号——与启动方式无关，幂等，失败不致命。"""
-    import ctypes
-    import glob
-    import sysconfig
-    if getattr(_preload_cudnn, "_done", False):
-        return
-    site = sysconfig.get_paths().get("purelib", "")
-    nvidia = os.path.join(site, "nvidia")
-    if not os.path.isdir(nvidia):
-        _preload_cudnn._done = True
-        return
-    libdirs = [os.path.join(nvidia, "cublas", "lib"),
-               os.path.join(nvidia, "cudnn", "lib")]
-    # 把目录加进 LD_LIBRARY_PATH（惠及可能的子进程）
-    cur = os.environ.get("LD_LIBRARY_PATH", "")
-    os.environ["LD_LIBRARY_PATH"] = ":".join([d for d in libdirs if os.path.isdir(d)] +
-                                             ([cur] if cur else []))
-    # 收集 so：先 cublas，再 cudnn 子库，最后主库 libcudnn.so.9
-    sos = []
-    for d in libdirs:
-        sos += sorted(glob.glob(os.path.join(d, "*.so*")))
-    sos.sort(key=lambda p: (os.path.basename(p).startswith("libcudnn.so"),))
-    # 多趟加载以满足相互依赖
-    for _ in range(3):
-        pending = []
-        for so in sos:
-            try:
-                ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pending.append(so)
-        if not pending:
-            break
-        sos = pending
-    _preload_cudnn._done = True
-
-
-def _patch_hf_auth_kwarg():
-    """huggingface_hub 1.x 移除了 hf_hub_download 的 use_auth_token 参数（改名 token），
-    但 pyannote.audio 3.3.2 仍在传 use_auth_token，导致 diarization 下载模型报
-    'unexpected keyword argument use_auth_token'。这里把该参数翻译成 token。
-    需要同时改掉 huggingface_hub 模块和已经 `from ... import hf_hub_download` 的引用。"""
-    import sys
-    import huggingface_hub
-    orig = huggingface_hub.hf_hub_download
-    if getattr(orig, "_auth_patched", False):
-        return
-
-    def wrapped(*args, **kwargs):
-        if "use_auth_token" in kwargs:
-            tok = kwargs.pop("use_auth_token")
-            if "token" not in kwargs:
-                kwargs["token"] = tok if isinstance(tok, str) else None
-        return orig(*args, **kwargs)
-
-    wrapped._auth_patched = True
-    huggingface_hub.hf_hub_download = wrapped
-    # 替换所有已导入模块里指向原函数的引用（pyannote 等在导入时已绑定）
-    for mod in list(sys.modules.values()):
-        try:
-            if getattr(mod, "hf_hub_download", None) is orig:
-                setattr(mod, "hf_hub_download", wrapped)
-        except Exception:
-            pass
-
-
-def _read_hf_token() -> str:
-    """按优先级读取 HuggingFace token：环境变量 → ~/.cache/huggingface/token。
-    diarization 用的 pyannote 模型是 gated，必须带 token。"""
-    for env in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"):
-        v = os.environ.get(env)
-        if v:
-            return v.strip()
-    token_file = Path.home() / ".cache" / "huggingface" / "token"
-    if token_file.exists():
-        return token_file.read_text(encoding="utf-8").strip()
-    return ""
+@contextmanager
+def _no_proxy():
+    """临时摘掉代理环境变量。dashscope 的 OSS 上传/查询走 aiohttp/requests，
+    会读 http(s)_proxy；HF 下载的 SOCKS 代理会把这些端点也拖进代理导致失败。
+    与 llm.make_httpx_client 同理：百炼端点要直连。"""
+    old = {k: os.environ.pop(k) for k in _PROXY_KEYS if k in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(old)
 
 
 class ASR:
-    """WhisperX 转写 + 词级对齐 + pyannote 说话人分离。
-    输出 transcript JSON 中每个 segment 多出一个 `speaker` 字段（SPEAKER_00/01…），
-    向后兼容旧的 {start,end,text} 结构。"""
+    """百炼 Paraformer 云端转写 + 说话人分离。"""
 
-    def __init__(self, model_name: str = "medium", language: str = "zh",
-                 compute_type: str = None, device: str = None,
-                 diarize: bool = True, min_speakers: int = None,
-                 max_speakers: int = None, batch_size: int = 16,
-                 split_by_speaker: bool = True, speaker_gap: float = 1.0):
+    def __init__(self, model: str = "paraformer-v2", api_key: str = None,
+                 language: str = "zh", language_hints: List[str] = None,
+                 diarize: bool = True):
         self.logger = None
-        self.model_name = model_name
+        self.model = model
+        self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY") or ""
         self.language = language
+        self.language_hints = language_hints or ["zh", "en"]
         self.diarize = diarize
-        self.min_speakers = min_speakers
-        self.max_speakers = max_speakers
-        self.batch_size = batch_size
-        self.split_by_speaker = split_by_speaker
-        self.speaker_gap = speaker_gap
-
-        import torch
-        if device:
-            self.device = device
-        else:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        if compute_type:
-            self.compute_type = compute_type
-        else:
-            self.compute_type = "float16" if self.device == "cuda" else "int8"
 
     def set_logger(self, logger):
         self.logger = logger
@@ -151,130 +62,103 @@ class ASR:
         if self.logger:
             self.logger.info(msg)
 
-    def _warn(self, msg):
-        if self.logger:
-            self.logger.warning(msg)
+    # ── 结果映射（纯函数，可测）────────────────────────────────────
+    @staticmethod
+    def _map_segments(data: dict, diarize: bool = True) -> List[dict]:
+        """百炼转录结果 → transcript segments。
 
-    def _split_by_speaker(self, seg) -> list:
-        """用词级 speaker 把一个转写段拆成若干「单人连续片段」。
-
-        Whisper 的段是按停顿切的，剧情片里一段常有 20+ 秒、跨好几个人的对话；
-        whisperx 只把「多数派」speaker 写在段上，词级归属就丢了。拿这种段去算
-        声纹，等于用一段混合音代表某个人——这是声纹认不准的源头。
-        对齐失败（无 words）时返回 [] 交给调用方按整段落盘。
+        paraformer 天然按「句」切分，一句即一个说话人的完整话，无需再按词级
+        拆分跨人长段。`speaker_id` 是句级整数（0 起），映射成 SPEAKER_xx。
         """
-        if not self.split_by_speaker:
-            return []
-        words = seg.get("words") or []
-        runs = []
-        for w in words:
-            st, en = w.get("start"), w.get("end")
-            txt = str(w.get("word") or "")
-            if st is None or en is None:      # 该词没对齐上：并进上一段，不单独成段
-                if runs:
-                    runs[-1]["text"] += txt
-                continue
-            spk = w.get("speaker") or "UNKNOWN"
-            st, en = float(st), float(en)
-            if runs and runs[-1]["speaker"] == spk \
-                    and st - runs[-1]["end"] <= self.speaker_gap:
-                runs[-1]["end"] = en
-                runs[-1]["text"] += txt
-            else:
-                runs.append({"start": st, "end": en, "speaker": spk, "text": txt})
-        return [{"start": round(r["start"], 3), "end": round(r["end"], 3),
-                 "text": r["text"].strip(), "speaker": r["speaker"]}
-                for r in runs if r["text"].strip()]
+        segments = []
+        for tr in (data.get("transcripts") or []):
+            for s in (tr.get("sentences") or []):
+                text = (s.get("text") or "").strip()
+                if not text:
+                    continue
+                seg = {
+                    "start": round(float(s.get("begin_time", 0)) / 1000.0, 3),
+                    "end": round(float(s.get("end_time", 0)) / 1000.0, 3),
+                    "text": text,
+                }
+                if diarize and s.get("speaker_id") is not None:
+                    seg["speaker"] = f"SPEAKER_{int(s['speaker_id']):02d}"
+                segments.append(seg)
+        return segments
+
+    # ── 云端链路 ──────────────────────────────────────────────────
+    def _extract_audio(self, video_path: str, tmp_dir: Path) -> str:
+        wav = tmp_dir / "audio.wav"
+        self._log("Extracting 16kHz mono audio ...")
+        run_ffmpeg(["-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le", str(wav)], check=True)
+        return str(wav)
+
+    def _transcribe_cloud(self, wav_path: str) -> dict:
+        from dashscope.audio.asr import Transcription
+        from dashscope.utils.oss_utils import OssUtils
+
+        if not self.api_key:
+            raise RuntimeError("未配置百炼 API key（asr.api_key 或 DASHSCOPE_API_KEY）")
+
+        kwargs = {"diarization_enabled": True} if self.diarize else {}
+        if self.model == "paraformer-v2" and self.language_hints:
+            kwargs["language_hints"] = self.language_hints
+        headers = {"X-DashScope-OssResourceResolve": "enable"}
+
+        with _no_proxy():
+            self._log("Uploading audio to DashScope OSS ...")
+            oss_url, _ = OssUtils.upload(
+                model=self.model, file_path=wav_path, api_key=self.api_key)
+            self._log(f"Submitting {self.model} (diarize={self.diarize}) ...")
+            resp = Transcription.async_call(
+                model=self.model, file_urls=[oss_url],
+                api_key=self.api_key, headers=headers, **kwargs)
+            if resp.status_code != 200 or not (resp.output or {}).get("task_id"):
+                raise RuntimeError(f"提交识别任务失败: code={resp.code} msg={resp.message}")
+            task_id = resp.output["task_id"]
+            self._log(f"Task submitted: {task_id}, waiting ...")
+            out = Transcription.wait(task=task_id, api_key=self.api_key,
+                                     headers=headers).output
+
+        if out.get("task_status") != "SUCCEEDED":
+            raise RuntimeError(f"识别任务失败: status={out.get('task_status')} "
+                               f"code={out.get('code')}")
+
+        results = out.get("results") or []
+        if not results:
+            raise RuntimeError("识别结果为空")
+        first = results[0]
+        url = (first.get("transcription_url")
+               or (first.get("output") or {}).get("transcription_url"))
+        if not url:
+            raise RuntimeError("结果里没有 transcription_url")
+        return self._download_result(url)
+
+    def _download_result(self, url: str) -> dict:
+        import httpx
+        with _no_proxy(), httpx.Client(trust_env=False, follow_redirects=True,
+                                       timeout=120.0) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.json()
 
     def transcribe(self, video_path: str, output_dir: str = "output") -> Tuple[str, str]:
-        import whisperx
-        _patch_torch_load()
-        _preload_cudnn()
-
-        self._log(f"Starting WhisperX transcription for: {video_path}")
-        self._log(f"Device={self.device} compute_type={self.compute_type} "
-                  f"model={self.model_name} lang={self.language} diarize={self.diarize}")
+        self._log(f"Starting Paraformer transcription for: {video_path}")
+        self._log(f"model={self.model} lang={self.language} diarize={self.diarize}")
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         base_name = Path(video_path).stem
 
-        # ── 1) ASR (faster-whisper backend) ─────────────────────────────
-        audio = whisperx.load_audio(video_path)
-        asr_model = whisperx.load_model(
-            self.model_name, self.device,
-            compute_type=self.compute_type, language=self.language,
-        )
-        self._log("Transcribing (faster-whisper)...")
-        result = asr_model.transcribe(audio, batch_size=self.batch_size)
-        # 释放 ASR 模型显存，给对齐/分离腾地方
-        del asr_model
-        gc.collect()
-        self._empty_cache()
+        with tempfile.TemporaryDirectory(prefix="asr_") as tmp:
+            wav = self._extract_audio(video_path, Path(tmp))
+            data = self._transcribe_cloud(wav)
 
-        # ── 2) 词级对齐（让分离能精确按词归属说话人）──────────────────
-        try:
-            align_model, metadata = whisperx.load_align_model(
-                language_code=self.language, device=self.device)
-            result = whisperx.align(
-                result["segments"], align_model, metadata, audio,
-                self.device, return_char_alignments=False)
-            del align_model
-            gc.collect()
-            self._empty_cache()
-            self._log("Word-level alignment done")
-        except Exception as e:
-            self._warn(f"Alignment skipped ({self.language} 可能无对齐模型): {e}")
-
-        # ── 3) 说话人分离（pyannote）────────────────────────────────────
-        speaker_assigned = False
+        segments = self._map_segments(data, self.diarize)
+        n_spk = len({s["speaker"] for s in segments if s.get("speaker")})
         if self.diarize:
-            token = _read_hf_token()
-            if not token:
-                self._warn("未找到 HF token，跳过说话人分离（仅产出无 speaker 的转写）")
-            else:
-                try:
-                    from whisperx.diarize import DiarizationPipeline
-                    _patch_hf_auth_kwarg()  # 兼容 huggingface_hub 1.x（pyannote 仍传 use_auth_token）
-                    diarize_model = DiarizationPipeline(
-                        use_auth_token=token, device=self.device)
-                    kw = {}
-                    if self.min_speakers:
-                        kw["min_speakers"] = self.min_speakers
-                    if self.max_speakers:
-                        kw["max_speakers"] = self.max_speakers
-                    self._log("Running pyannote speaker diarization...")
-                    diarize_segments = diarize_model(audio, **kw)
-                    result = whisperx.assign_word_speakers(diarize_segments, result)
-                    speaker_assigned = True
-                    n_spk = len({s.get("speaker") for s in result["segments"]
-                                 if s.get("speaker")})
-                    self._log(f"Diarization done: {n_spk} distinct speakers")
-                    del diarize_model
-                    gc.collect()
-                    self._empty_cache()
-                except Exception as e:
-                    self._warn(f"Diarization failed, 输出无 speaker 转写: {e}")
-
-        # ── 4) 落盘 ─────────────────────────────────────────────────────
-        segments = []
-        n_split = 0
-        for seg in result.get("segments", []):
-            parts = self._split_by_speaker(seg) if speaker_assigned else None
-            if not parts:
-                item = {
-                    "start": round(float(seg.get("start", 0.0)), 3),
-                    "end": round(float(seg.get("end", 0.0)), 3),
-                    "text": (seg.get("text") or "").strip(),
-                }
-                if speaker_assigned:
-                    item["speaker"] = seg.get("speaker") or "UNKNOWN"
-                segments.append(item)
-                continue
-            n_split += len(parts) > 1
-            segments.extend(parts)
-        if n_split:
-            self._log(f"按词级说话人拆分了 {n_split} 个跨人转写段")
+            self._log(f"Diarization done: {n_spk} distinct speakers")
 
         transcript_path = output_path / f"{base_name}_transcript.json"
         srt_path = output_path / f"{base_name}_full.srt"
@@ -295,28 +179,15 @@ class ASR:
 
         return str(transcript_path), str(srt_path)
 
-    def _empty_cache(self):
-        try:
-            import torch
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
 
 def transcribe_video(video_path: str, config, output_dir: str = "output") -> Tuple[str, str]:
     asr_cfg = config.asr
     asr = ASR(
-        model_name=asr_cfg.get("model", "medium"),
+        model=asr_cfg.get("model", "paraformer-v2"),
+        api_key=asr_cfg.get("api_key"),
         language=asr_cfg.get("language", "zh"),
-        compute_type=asr_cfg.get("compute_type"),
-        device=asr_cfg.get("device"),
+        language_hints=asr_cfg.get("language_hints"),
         diarize=asr_cfg.get("diarize", True),
-        min_speakers=asr_cfg.get("min_speakers"),
-        max_speakers=asr_cfg.get("max_speakers"),
-        batch_size=asr_cfg.get("batch_size", 16),
-        split_by_speaker=asr_cfg.get("split_by_speaker", True),
-        speaker_gap=float(asr_cfg.get("speaker_gap", 1.0)),
     )
     asr.set_logger(config.get_logger("ASR"))
     return asr.transcribe(video_path, output_dir)
@@ -329,8 +200,10 @@ if __name__ == "__main__":
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     config = load_config(config_path)
     asr = ASR(
-        model_name=config.asr.get("model", "medium"),
+        model=config.asr.get("model", "paraformer-v2"),
+        api_key=config.asr.get("api_key"),
         language=config.asr.get("language", "zh"),
+        language_hints=config.asr.get("language_hints"),
         diarize=config.asr.get("diarize", True),
     )
     asr.set_logger(config.get_logger("ASR"))

@@ -25,6 +25,12 @@ _SAVED_PROXY = {k: os.environ.get(k) for k in _PROXY_KEYS}
 for _k in _PROXY_KEYS:
     os.environ.pop(_k, None)
 
+# Gradio 默认临时目录是 /tmp/gradio，多用户机器上可能被别的用户占用（无写权限），
+# 指到本用户目录避免 PermissionError（必须在 import gradio 前设置）。
+_GRADIO_TMP = Path.home() / ".cache" / "gradio"
+_GRADIO_TMP.mkdir(parents=True, exist_ok=True)
+os.environ["GRADIO_TEMP_DIR"] = str(_GRADIO_TMP)
+
 import yaml
 import gradio as gr
 
@@ -141,7 +147,7 @@ def _build_run_tab():
                 gr.Markdown(
                     "| 勾选 | 这一步做什么 | 什么时候勾 |\n"
                     "|---|---|---|\n"
-                    "| 语音识别 | 整集音频→带说话人的转写文本（最慢，GPU 数分钟） | 换了视频文件；改了 Whisper 模型/语言/说话人数范围 |\n"
+                    "| 语音识别 | 整集音频→带说话人的转写文本（云端，约几十秒） | 换了视频文件；改了 ASR 模型/语言/是否分离 |\n"
                     "| 剧情分析 | LLM 读转写挑选精彩节拍（决定剪哪些片段） | **最常用**：对选片不满意想重选；改了目标时长/模式；说话人命名后想让分析用上真名 |\n"
                     "| 画面备注 | VLM 观看选中节拍的画面出备注（需在设置开启） | 基本不用手勾：节拍/模型变了自动重看；换了角色参考图想重新指认时勾 |\n"
                     "| 解说生成 | LLM 写解说词 + TTS 配音 | 只对解说词/配音不满意、选片可以不动（自动连带重新裁剪混音） |\n"

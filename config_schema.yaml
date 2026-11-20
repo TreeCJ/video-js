@@ -20,17 +20,13 @@ groups:
 
   - title: 语音识别 (ASR)
     fields:
-      - {path: asr.model, label: Whisper 模型, type: choice, choices: [tiny, base, small, medium, large-v3]}
+      - {path: asr.model, label: Paraformer 模型, type: choice, choices: [paraformer-v2, paraformer-mtl-v1, sensevoice-v1], info: paraformer-v2=中文+中英混合(支持说话人分离)；多语言剧用后两者}
       - {path: asr.language, label: 语言, type: choice, choices: [ko, zh, en, ja]}
-      - {path: asr.diarize, label: 说话人分离(需HF token), type: bool}
-      - {path: asr.min_speakers, label: 最少说话人数(0=自动), type: count, info: 填已知主要角色数下限，限定范围能显著提升分离准确度}
-      - {path: asr.max_speakers, label: 最多说话人数(0=自动), type: count, info: 填含配角的人数上限，如 12}
-      - {path: asr.compute_type, label: 计算精度, type: choice, choices: [float16, int8, float32]}
-      - {path: asr.batch_size, label: 批大小, type: number, min: 1, max: 32, step: 1}
+      - {path: asr.diarize, label: 说话人分离, type: bool, info: 云端自动分离，输出 SPEAKER_xx}
+      - {path: asr.api_key, label: 百炼 API Key, type: secret}
 
   - title: 说话人命名
     fields:
-      - {path: asr.split_by_speaker, label: 按说话人拆分转写段, type: bool, info: 用词级归属把跨人的长段拆成单人片段；关掉会退回「一段20秒跨好几个人只标多数派」}
       - {path: naming.enabled, label: 启用真名替换, type: bool, info: LLM 读台词把 SPEAKER_xx 换成角色真名；需要背景资料里有角色介绍}
       - {path: naming.max_dialogue_chars, label: 命名对白上限(字), type: number, min: 4000, max: 60000, step: 2000, info: 喂给 LLM 的本集对白量；超出按整集均匀抽样}
 

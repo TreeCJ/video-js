@@ -8,9 +8,5 @@ psutil>=5.9
 numpy>=1.26
 edge-tts>=6.1
 
-# ASR + 说话人分离：版本必须钉住（whisperx 4.x 要求 torch 2.8 + pyannote 4，与本项目不兼容）
-# torch / torchaudio 请先按 README 单独安装，再装下面这些
-whisperx==3.3.1
-pyannote.audio==3.3.2
-faster-whisper==1.1.1
-ctranslate2==4.5.0
+# ASR：阿里百炼 Paraformer 云端转写 + 说话人分离（无需本地 GPU/模型）
+dashscope==1.25.19

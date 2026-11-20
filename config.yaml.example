@@ -8,16 +8,12 @@ video:
   skip_outro_seconds: 180                  # 片尾曲时长(秒)，自动排除
   series_background_file: "data/series_background.md"   # 剧集背景外置到文件，内容见该文件
 asr:
-  model: "medium"                           # tiny | base | small | medium | large-v3（剧情类建议 small+）
-  language: "zh"                           # 片源语言：zh | en | ja | ko 等
-  # ── WhisperX 说话人分离（diarization）──
-  diarize: true                             # true=输出每段 speaker(SPEAKER_00/01…)，需 HF token
-  compute_type: "float16"                   # float16(GPU,质量好) | int8(省显存) | float32(CPU)
-  batch_size: 16                            # faster-whisper 批大小，显存紧张可调小
-  min_speakers: 4                           # 已知说话人数下限可填(如 2)，留空自动
-  max_speakers: 18                          # 上限可填(如 8)，留空自动；限定范围能提升准确度
-  split_by_speaker: true                    # 按词级 speaker 把跨人的长转写段拆成单人片段。⚠️关掉会退回「一段20秒跨好几个人只标多数派」，命名与剧情归属都会不准
-  speaker_gap: 1.0                          # 同一人内部停顿超此(秒)也断开成新段
+  backend: "bailian"                        # 云端 ASR：阿里百炼 Paraformer
+  model: "paraformer-v2"                    # paraformer-v2(中文+中英混合,支持说话人分离) | paraformer-mtl-v1(多语言) | sensevoice-v1(多语言)
+  api_key: "${DASHSCOPE_API_KEY}"           # 百炼 API Key；也可直接填明文（config.yaml 已被 gitignore）
+  language: "zh"                            # 片源语言：zh | en | ja | ko 等（命名/提示词用）
+  language_hints: ["zh", "en"]              # 仅 paraformer-v2 支持；中英混合提升识别率
+  diarize: true                             # true=云端说话人分离，输出每段 speaker(SPEAKER_00/01…)
 
 # ── 说话人命名（把 SPEAKER_xx 换成角色真名）────────────────────
 # 靠读台词，不靠听声音：身份信号绝大多数直接写在对白里（自称「朕」「奴婢」、
@@ -118,7 +114,7 @@ output_formats:
 
 subtitle:
   enabled: true
-  font_path: "fonts/wqy-microhei.ttc"      # 中文字体路径
+  font_path: "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"   # 中文字体路径（Ubuntu 装 fonts-wqy-microhei 后的位置；也可用 Noto CJK）
 
 # ── 电影解说（explain-only）核心 ──────────────────────────────
 narration:

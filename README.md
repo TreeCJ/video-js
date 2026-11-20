@@ -6,7 +6,7 @@
 原片 → 语音转写+说话人分离 → 角色命名 → LLM 挑剧情节拍 → 解说配音 / 影评评论 → 裁剪拼接 → 混音 → 字幕渲染
 ```
 
-- **语言无关**：ASR 用 WhisperX，LLM 直接读原文台词，韩剧、日剧、美剧、国产剧都能处理。
+- **语言无关**：ASR 用阿里百炼 Paraformer 云端识别，LLM 直接读原文台词，韩剧、日剧、美剧、国产剧都能处理。
 - **三种剪辑模式**：画面主导解说、旁白主导解说、原声混剪+影评评论。
 - **防"张冠李戴"**：说话人分离 → LLM 读台词给说话人命名 → 可选人脸库 + 视觉模型看画面 → 整集自检。
 - **Web 操作台**：选集、调参、编辑剧情背景、看日志、做封面、人脸标注，全在浏览器里完成。
@@ -51,10 +51,10 @@
 |---|---|
 | 操作系统 | Linux（在 Ubuntu 20.04/22.04 上验证）；macOS 可跑但没有 CUDA 加速 |
 | Python | 3.10 – 3.12 |
-| GPU | 推荐 NVIDIA GPU ≥ 8 GB 显存（ASR/说话人分离/本地视觉模型）。没有 GPU 也能跑，只是慢很多 |
+| GPU | 可选。ASR/说话人分离走云端不占显存；本地视觉模型、人脸标注需要时再上 GPU |
 | ffmpeg | 必需，≥ 5.0，需要在 `PATH` 里 |
 | LLM | 任意 **OpenAI 兼容** 的 Chat API（DeepSeek、通义千问、Kimi、OpenAI 等） |
-| HuggingFace 账号 | 说话人分离用到 pyannote 的 gated 模型，需要 token |
+| 阿里云百炼账号 | ASR + 说话人分离走 Paraformer 云端接口，需要 API Key |
 
 ---
 
@@ -114,9 +114,8 @@ pip install torch==2.7.0 torchaudio==2.7.0 --index-url https://download.pytorch.
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 里把 `whisperx==3.3.1 / pyannote.audio==3.3.2 / ctranslate2==4.5.0 /
-faster-whisper==1.1.1` 钉死了——whisperx 4.x 要求 torch 2.8 + pyannote 4，与本项目不兼容，**不要升级**。
-装完检查 torch 没被替换：
+语音识别用阿里百炼 Paraformer 云端接口（`dashscope==1.25.19`），无需本地 GPU 跑 ASR 模型。
+`torch` 仅用于人脸标注和本地画面备注（可选），装完检查 torch 没被替换：
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
@@ -133,23 +132,19 @@ pip install -r requirements-optional.txt
 | insightface、onnxruntime-gpu、opencv-python、scikit-learn | Web 操作台「人脸标注」页（无 GPU 把 `onnxruntime-gpu` 换成 `onnxruntime`） |
 | transformers、accelerate、qwen-vl-utils | 画面备注用本地视觉模型（`scene_notes.backend: local`） |
 
-### 6. 配置 HuggingFace token（说话人分离）
+### 6. 配置百炼 API Key（语音识别 + 说话人分离）
 
-1. 注册 [huggingface.co](https://huggingface.co)，在 *Settings → Access Tokens* 创建一个 Read token。
-2. 打开下面两个页面，分别点 **Agree and access repository** 接受协议：
-   - <https://huggingface.co/pyannote/speaker-diarization-3.1>
-   - <https://huggingface.co/pyannote/segmentation-3.0>
-3. 把 token 告诉程序，任选一种：
+1. 在[阿里云百炼控制台](https://bailian.console.aliyun.com/)开通「语音识别」并创建 API Key。
+2. 把 Key 告诉程序，任选一种：
 
    ```bash
-   huggingface-cli login                 # 写入 ~/.cache/huggingface/token
-   # 或
-   export HF_TOKEN=hf_xxxxxxxxxxxxxxxx
+   export DASHSCOPE_API_KEY=sk-xxxxxxxx     # 环境变量
+   # 或直接在 config.yaml 的 asr.api_key 里填明文（config.yaml 已被 .gitignore 忽略）
    ```
 
-> 国内网络访问 HuggingFace 可设置 `export HF_ENDPOINT=https://hf-mirror.com`，或者走代理
-> （SOCKS 代理需要 `socksio`，`requirements.txt` 里的 `httpx[socks]` 已包含）。
-> 不需要说话人信息时可以在配置里关掉 `asr.diarize`，就不需要 token。
+> ASR 走云端（Paraformer），音频会临时上传到百炼 OSS、转写结果 24h 内有效。默认用 SDK 临时
+> 上传（48h 有效、限流 100 QPS），单机离线处理够用；高并发/生产建议自建 OSS 传公网 URL。
+> 不需要说话人信息时可在配置里关掉 `asr.diarize`（转写仍会进行）。
 
 ### 7. 创建配置文件
 
@@ -187,12 +182,11 @@ video:
   series_background_file: "data/series_background.md"   # 剧情背景（见下文，强烈建议）
 
 asr:
-  model: "medium"                       # tiny | base | small | medium | large-v3，剧情类建议 medium 以上
-  language: "ko"                        # 片源语言：zh | en | ja | ko …
-  diarize: true                         # 说话人分离（需要 HF token）
-  compute_type: "float16"               # GPU 用 float16；显存紧张用 int8；CPU 用 float32
-  min_speakers: 4                       # 已知人数范围填上能明显提升分离准确度
-  max_speakers: 18
+  model: "paraformer-v2"                # paraformer-v2(中文+中英混合,支持说话人分离) | paraformer-mtl-v1(多语言) | sensevoice-v1(多语言)
+  api_key: "${DASHSCOPE_API_KEY}"       # 百炼 API Key
+  language: "ko"                        # 片源语言：zh | en | ja | ko …（命名/提示词用）
+  language_hints: ["zh", "en"]          # 仅 paraformer-v2 支持；中英混合提升识别率
+  diarize: true                         # 云端说话人分离，输出 SPEAKER_xx
 
 narration:
   tts:
@@ -274,7 +268,7 @@ python src/main.py --help                  # 全部参数
 
 1. **放视频**：新剧视频放进 `input/`；旧剧的 `output/` 子目录挪走或删掉。
 2. **写背景**：按上面的格式写剧情背景（人物介绍必须有，分集剧情有更好）。
-3. **改配置**：片源语言 `asr.language`、说话人数范围 `asr.min/max_speakers`、剧名、署名、片头片尾秒数。
+3. **改配置**：片源语言 `asr.language`、ASR 模型 `asr.model`、剧名、署名、片头片尾秒数。
 4. **（可选）先只转写**：运行页勾「仅转写」批量跑一遍，抽查 `output/<集>/<集>_transcript.json` 质量。
 5. **（可选）人脸标注**：只有开启 `scene_notes.enabled` 才需要。「🙂 人脸标注」页：
    ① 生成人物候选 → ② 每格填角色真名（路人留空，同一人拆成两格就填同一个名字）→ ③ 保存。
@@ -284,7 +278,7 @@ python src/main.py --help                  # 全部参数
 
 ### 说话人命名
 
-`SPEAKER_xx` 是 pyannote 每集单独分配的编号，跨集没有意义。命名步骤让 LLM 读本集台词，
+`SPEAKER_xx` 是云端说话人分离每集单独分配的编号，跨集没有意义。命名步骤让 LLM 读本集台词，
 根据自称、称谓、职务（「张队」「王总」「朕」）把编号对应到角色表里的名字：
 
 - 只接受角色表里的名字，表外的一律丢弃；
@@ -304,7 +298,7 @@ python src/speaker_naming.py --rename --episode 3   # 参数是 output/ 下的�
 
 | # | 步骤 | 模块 | 产物 |
 |---|---|---|---|
-| 1 | 语音识别 | `src/asr.py` | WhisperX 转写 → 词级对齐 → pyannote 说话人分离；跨人长段按词级说话人拆开。`*_transcript.json`、`*_full.srt` |
+| 1 | 语音识别 | `src/asr.py` | 百炼 Paraformer 云端转写 + 说话人分离（按句切分，一句一个 speaker）。`*_transcript.json`、`*_full.srt` |
 | 1.5 | 说话人命名 | `src/speaker_naming.py` | 转写里的 `SPEAKER_xx` 换成真名（原编号保留在 `speaker_raw`） |
 | 2 | 剧情分析 | `src/analyzer.py` | LLM 选剧情节拍 + 标题，带覆盖度护栏。`*_key_segments.json` |
 | 2.5 | 画面备注（可选） | `src/scene_notes.py` | 每拍抽帧给视觉模型，产出「谁在场/在做什么/场景/氛围」；人脸库已建时由 InsightFace 认人。`*_scene_notes.json` |
@@ -328,7 +322,7 @@ python src/speaker_naming.py --rename --episode 3   # 参数是 output/ 下的�
 
 | 想要的效果 | 强制重做 |
 |---|---|
-| 换了视频文件 / Whisper 模型 / 语言 / 说话人数范围 | 语音识别 `--force-asr` |
+| 换了视频文件 / ASR 模型 / 语言 / 是否分离 | 语音识别 `--force-asr` |
 | 对选的片段不满意；改了目标时长或模式；改了角色表 | 剧情分析 `--force-analysis` |
 | 只想换一版解说词 / 配音 | 解说生成 `--force-narration`（自动连带重新裁剪+混音） |
 | remix 模式只想换一批评论 | 影评评论 `--force-commentary` |
@@ -370,22 +364,20 @@ logs/webui/                       # Web 操作台运行日志
 Gradio 启动自检会被 `http_proxy` / `all_proxy` 拦截。`app.py` 已经在导入 gradio 前清掉代理、
 运行管线时再把代理传给子进程，正常不需要处理。仍有问题时用 `curl --noproxy '*' http://127.0.0.1:6006` 确认服务本身是否正常。
 
-**`unexpected keyword argument 'use_auth_token'` / `weights_only` / 找不到 `libcudnn`**
-这三个是 whisperx 3.3 + pyannote 3.3 在新版 huggingface_hub / torch 下的已知兼容问题，`src/asr.py` 里已打补丁自动处理。
-如果仍出现，检查是否误升级了 `whisperx` / `pyannote.audio` / `ctranslate2`（版本要和 `requirements.txt` 一致）。
+**百炼识别任务报 `SERVER_ERROR` / 提交失败**
+本地上传的音频需要走 OSS 解析，`src/asr.py` 已自动带上 `X-DashScope-OssResourceResolve: enable` 头；
+若仍失败，检查 `asr.api_key` 是否有效、是否开通了「语音识别」服务。
 
-**说话人分离报 401 / 403**
-没有接受两个 pyannote 模型的协议，或 token 没生效。见 [安装第 6 步](#6-配置-huggingface-token说话人分离)。
-
-**一集被分出二十多个说话人**
-整集级别的 pyannote 会过度切分。填上 `asr.min_speakers` / `asr.max_speakers` 能明显改善；主要角色通常是稳定的。
+**说话人分离报错 / 没有 speaker**
+确认 `asr.diarize: true` 且模型支持分离（`paraformer-v2`）。云端按句自动分离人数，无法像
+本地那样限定人数范围。
 
 **`No capable devices found`，编码很慢**
 NVENC 不可用（容器没开放 `video` capability 或驱动不匹配），已自动回退 CPU 编码。可用
 `ffmpeg -y -f lavfi -i color=c=black:s=320x240:d=1 -c:v h264_nvenc -f null -` 单独测试。
 
 **显存不够**
-`asr.compute_type: int8`、调小 `asr.batch_size`；画面备注调小 `scene_notes.batch_size` 或改用 `backend: api`；人脸标注设 `faces.device: cpu`。
+ASR 走云端不占显存；画面备注调小 `scene_notes.batch_size` 或改用 `backend: api`；人脸标注设 `faces.device: cpu`。
 
 **字幕是方块**
 没找到中文字体，见 [安装第 2 步](#2-安装系统依赖)。
@@ -410,7 +402,7 @@ NVENC 不可用（容器没开放 `video` capability 或驱动不匹配），已
 │   ├── main.py                # CLI 入口
 │   ├── pipeline.py            # 步骤注册、缓存指纹、流程编排
 │   ├── config.py              # 配置加载（支持 ${ENV} 注入）
-│   ├── asr.py                 # WhisperX 转写 + 说话人分离
+│   ├── asr.py                 # 百炼 Paraformer 云端转写 + 说话人分离
 │   ├── speaker_naming.py      # LLM 说话人命名
 │   ├── analyzer.py            # 剧情节拍分析
 │   ├── scene_notes.py         # 视觉模型画面备注
