@@ -3,12 +3,29 @@ import json
 import time
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EP_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv")
 
 
+def input_dir() -> Path:
+    """输入视频目录：读 config.video.input_dir（相对 REPO_ROOT 解析）。
+
+    upload 与 input_videos 共用此函数，保证上传落盘目录与扫描目录一致。
+    """
+    try:
+        with open(REPO_ROOT / "config.yaml", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except OSError:
+        cfg = {}
+    rel = (cfg.get("video", {}) or {}).get("input_dir") or "input"
+    p = Path(rel)
+    return p if p.is_absolute() else (REPO_ROOT / p)
+
+
 def input_videos():
-    d = REPO_ROOT / "input"
+    d = input_dir()
     if not d.exists():
         return []
     return sorted([f.name for f in d.iterdir() if f.suffix.lower() in EP_EXTS],
