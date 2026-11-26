@@ -34,12 +34,14 @@ os.environ["GRADIO_TEMP_DIR"] = str(_GRADIO_TMP)
 
 import yaml
 import gradio as gr
+from gradio import routes
 
 from pipeline import STEPS, timer
 from runner import JobRunner, list_history_logs, read_history_log
 import status as st
 import schema as sc
 import background as bg
+import upload
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = REPO_ROOT / "config.yaml"
@@ -444,10 +446,11 @@ def _build_run_tab():
         with gr.Column(scale=1):
             with gr.Group(elem_classes="card"):
                 gr.Markdown("### ① 选择剧集", elem_classes="card-title")
+                gr.HTML(value="", elem_id="upload-anchor")
                 videos = gr.CheckboxGroup(label="剧集列表（可多选，批量顺序处理）",
                                           choices=st.input_videos(), interactive=True)
                 with gr.Row():
-                    refresh_vid = gr.Button("刷新", size="sm")
+                    refresh_vid = gr.Button("刷新", size="sm", elem_id="refresh-videos")
                     sel_all = gr.Button("全选", size="sm")
                     sel_none = gr.Button("清空", size="sm")
         with gr.Column(scale=1):
@@ -855,12 +858,20 @@ def build_app():
 def main():
     (REPO_ROOT / "input").mkdir(exist_ok=True)
     (REPO_ROOT / "output").mkdir(exist_ok=True)
+    upload.cleanup_stale()
     app = build_app()
-    app.queue(default_concurrency_limit=4).launch(
+    app.queue(default_concurrency_limit=4)
+    # Gradio 6 的 queue()/launch() 都会重建 FastAPI app，自定义路由会丢。
+    # 官方钩子：自建 routes.App 基座注册上传路由，launch(_app=base) 让 Gradio
+    # 把页面与 gradio_api 挂到该基座上，上传端点与原页面同源共存。
+    base = routes.App()
+    upload.register_routes(base)
+    app.launch(
         server_name="0.0.0.0", server_port=6006, share=False,
-        theme=_build_theme(), css=CSS,
+        theme=_build_theme(), css=CSS, js=upload.UPLOAD_JS,
         allowed_paths=[str((REPO_ROOT / "output").resolve()),
-                       str((REPO_ROOT / "input").resolve())])
+                       str((REPO_ROOT / "input").resolve())],
+        _app=base)
 
 
 if __name__ == "__main__":

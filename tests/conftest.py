@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parents[1] / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+ROOT = Path(__file__).resolve().parents[1]
+for p in (ROOT / "src", ROOT / "src" / "webui"):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
