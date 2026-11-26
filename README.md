@@ -9,8 +9,8 @@
 - **语言无关**：ASR 用阿里百炼 Paraformer 云端识别，LLM 直接读原文台词，韩剧、日剧、美剧、国产剧都能处理。
 - **三种剪辑模式**：画面主导解说、旁白主导解说、原声混剪+影评评论。
 - **防"张冠李戴"**：说话人分离 → LLM 读台词给说话人命名 → 可选人脸库 + 视觉模型看画面 → 整集自检。
-- **Web 操作台**：选集、调参、编辑剧情背景、看日志、做封面、人脸标注，全在浏览器里完成。
-- **智能缓存**：每一步都有产物指纹，参数变了自动重跑，没变就复用。
+- **Web 操作台**：深色主题工作台。拖拽上传视频（自动分片）、选集、调参、看 9 步进度条、成片预览下载、编辑剧情背景、看日志、做封面、人脸标注，全在浏览器里完成。
+- **智能缓存**：每一步都有产物指纹，参数变了自动重跑，没变就复用；下游步骤随上游自动级联。
 
 ---
 
@@ -208,6 +208,7 @@ author:
 | `naming.enabled` | LLM 读台词把 `SPEAKER_xx` 换成角色真名（需要剧情背景里有人物介绍） |
 | `scene_notes.enabled` | 让视觉模型看每个节拍的画面，给解说/评论补「画面事实」。`backend: local` 用本机 GPU（默认 Qwen3-VL-2B，约 4.5 GB 显存），`backend: api` 用 OpenAI 兼容多模态接口 |
 | `commentary.*` | remix 模式的评论字数、密度、三类评论占比、字色 |
+| `max_parts` | 把一集成片拆成 N 个子视频（1=不拆分），拆分后产物在 `output/<集>/partN/` 下 |
 | `output_formats` | 输出画幅和分辨率，默认竖屏 1080×1920 + 横屏 1920×1080 |
 | `description / copyright_notice / ending / bgm` | 顶部标题、二创声明、片尾文字、背景音乐 |
 
@@ -231,7 +232,7 @@ LLM 只能看到台词。给它一份剧情背景，分析、命名、解说、�
 把视频放进 `input/`，文件名里带集数即可，例如 `1.mp4`、`第02集.mkv`、`S01E03.mp4`。
 支持 `mp4 / mkv / mov / avi / flv / wmv`。
 
-不用手动传文件：也可以在 Web 操作台「运行 / 调试」页直接把视频**拖进上传区**（支持多选、大文件自动 8MB 分片上传、单片失败自动重试，传完自动刷新剧集列表；同名文件自动改名不覆盖）。
+不用手动传文件：也可以在 Web 操作台「运行 / 调试」页直接把视频**拖进上传区**（支持多选）。前端按 **8MB/片自动分片、3 并发上传、单片失败自动重试 3 次**，合并后经 `ffprobe` 校验、原子落盘；同名文件自动改名不覆盖，上传完自动刷新剧集列表。WebUI 启动时会清理超过 24 小时的残留分片与 `.part` 残片。
 
 ### 方式一：Web 操作台（推荐）
 
@@ -245,10 +246,10 @@ python src/webui/app.py          # 前台运行
 
 | 标签页 | 作用 |
 |---|---|
-| ▶ 运行 / 调试 | 拖拽上传新视频（大文件自动分片）→ 多选集数 → 选模式、选材方案、目标时长 →（可选）强制重做某一步 → 运行。管线在独立子进程里跑，日志实时显示，「停止」会连同 ffmpeg 一起终止。多集自动排队 |
+| ▶ 运行 / 调试 | ① 拖拽上传新视频（8MB 分片）→ 多选集数 → ② 选模式、选材方案、目标时长 →（可选）强制重做某一步 → 运行。下方有 **9 步进度条**（转写/命名/分析/画面备注/解说·评论/裁剪/混音/渲染逐格变色）、任务队列和**成片预览下载**；日志面板按钮展开收起。「停止」会连同 ffmpeg 一起终止。多集自动排队、单 worker 顺序执行 |
 | 📊 集状态 | 每集各阶段（转写/节拍/解说·评论/trimmed/成片）是否已生成 |
 | 📖 剧情背景 | 编辑剧情背景 markdown，保存自动备份；可预览某集实际抽到的背景 |
-| ⚙️ 设置 | 常用配置的表单 + 整篇 YAML 高级编辑。「仅本次生效」不写文件，「保存为默认」写回 `config.yaml`（保留注释，自动备份 `.bak`） |
+| ⚙️ 设置 | 常用配置的表单 + 整篇 YAML 高级编辑（表单字段由 `config_schema.yaml` 驱动）。「仅本次生效」不写文件，「保存为默认」写回 `config.yaml`（保留注释，自动备份 `.bak`） |
 | 📜 历史日志 | 查看历史运行日志（密钥已脱敏） |
 | 🖼️ 封面图 | 从成片截帧 + 叠加标题，导出封面 |
 | 🙂 人脸标注 | 建立人脸库，让画面备注确定性地认出角色（见下文） |
@@ -263,8 +264,11 @@ python src/main.py --video 2               # 只处理第 2 集（精确匹配 2
 python src/main.py --video 2 --mode remix  # 临时切换模式
 python src/main.py --video 2 --cut-style pure
 python src/main.py --config my.yaml        # 使用其他配置文件
+python src/main.py --overrides ov.json     # JSON 深合并进 config（webui/脚本传运行期配置用）
 python src/main.py --help                  # 全部参数
 ```
+
+每一步都有 `--force-<步骤>` / `--skip-<步骤>` 开关（如 `--force-scene-notes`、`--force-cutting`、`--force-render`、`--skip-narration`），完整列表见 `--help`。
 
 ### 处理一部新剧（完整流程）
 
@@ -301,14 +305,16 @@ python src/speaker_naming.py --rename --episode 3   # 参数是 output/ 下的�
 | # | 步骤 | 模块 | 产物 |
 |---|---|---|---|
 | 1 | 语音识别 | `src/asr.py` | 百炼 Paraformer 云端转写 + 说话人分离（按句切分，一句一个 speaker）。`*_transcript.json`、`*_full.srt` |
-| 1.5 | 说话人命名 | `src/speaker_naming.py` | 转写里的 `SPEAKER_xx` 换成真名（原编号保留在 `speaker_raw`） |
-| 2 | 剧情分析 | `src/analyzer.py` | LLM 选剧情节拍 + 标题，带覆盖度护栏。`*_key_segments.json` |
-| 2.5 | 画面备注（可选） | `src/scene_notes.py` | 每拍抽帧给视觉模型，产出「谁在场/在做什么/场景/氛围」；人脸库已建时由 InsightFace 认人。`*_scene_notes.json` |
-| 3a | 解说生成 | `src/narration_generator.py` | 解说模式：LLM 写整集解说 + 自检 → TTS 配音 → 按配音时长反推画面时长 |
-| 3b | 影评评论 | `src/commentary_generator.py` | remix 模式：逐拍生成解读/影评/共鸣三类短评 → 整集自检 |
-| 4 | 裁剪拼接 | `src/cutter.py` | 按节拍裁片段无缝拼接。`trimmed.mp4` |
-| 5 | 混音 | `src/audio_mixer.py` | 解说叠加 + 原声压低（picture_led 只在解说时压低，梯形包络防爆音）+ 可选 BGM |
-| 6 | 字幕渲染 | `src/subtitle_adder.py` | 缩放加黑边、解说字幕/评论、标题、署名、声明。最终成片 |
+| 2 | 说话人命名（可选） | `src/speaker_naming.py` | 转写里的 `SPEAKER_xx` 换成真名（原编号保留在 `speaker_raw`）；未启用则跳过 |
+| 3 | 剧情分析 | `src/analyzer.py` | LLM 选剧情节拍 + 标题，带覆盖度护栏。`*_key_segments.json`、`quality_report.json` |
+| 4 | 画面备注（可选） | `src/scene_notes.py` | 每拍抽帧给视觉模型，产出「谁在场/在做什么/场景/氛围」；人脸库已建时由 InsightFace 认人。`*_scene_notes.json` |
+| 5 | 解说生成（非 remix） | `src/narration_generator.py` | LLM 写整集解说 + 自检 → TTS 配音 → 按配音时长反推画面时长 |
+| 6 | 影评评论（remix） | `src/commentary_generator.py` | 逐拍生成解读/影评/共鸣三类短评 → 整集自检 |
+| 7 | 裁剪拼接 | `src/cutter.py` | 按节拍裁片段无缝拼接。`trimmed.mp4` |
+| 8 | 混音（非 remix） | `src/audio_mixer.py` | 解说叠加 + 原声压低（picture_led 只在解说时压低，梯形包络防爆音）+ 可选 BGM |
+| 9 | 字幕渲染 | `src/subtitle_adder.py` | 每个输出格式各渲染一次：缩放加黑边、解说字幕/评论、标题、署名、声明。最终成片 |
+
+运行日志里的 `[i/9 Label]` 前缀（Web 操作台的进度条也解析它）就是这张表。`max_parts > 1` 时，第 7–9 步会按拆分后的每部分别执行。
 
 **音画对齐**：裁剪、混音、字幕三个模块都使用同一个每拍时长 `end_time - start_time` 和累积起点，
 所以第 i 段画面、第 i 条解说、第 i 块字幕逐帧对齐。
@@ -320,18 +326,22 @@ python src/speaker_naming.py --rename --episode 3   # 参数是 output/ 下的�
 ## 缓存与重跑
 
 每一步都会检查产物是否存在、指纹是否有效（节拍、相关配置变了就失效），有效就复用（日志显示 `CACHED`），
-失效就自动重跑。**只有「产物有效但你想换个结果」时才需要强制重做**，并且只勾最上游的那一步，下游会自动级联。
+失效就自动重跑。其中**裁剪/渲染用节拍指纹**（存于 `output/<集>/.pipeline_state.json`）：上游节拍变了会自动重切/重渲，
+不需要手动清理旧产物；画面备注按「节拍起点 + 视觉模型/抽帧参数」缓存。
+**只有「产物有效但你想换个结果」时才需要强制重做**，并且只勾最上游的那一步，下游会自动级联。
 
 | 想要的效果 | 强制重做 |
 |---|---|
 | 换了视频文件 / ASR 模型 / 语言 / 是否分离 | 语音识别 `--force-asr` |
 | 对选的片段不满意；改了目标时长或模式；改了角色表 | 剧情分析 `--force-analysis` |
+| 换了视觉模型 / 角色参考图，想重看画面 | 画面备注 `--force-scene-notes` |
 | 只想换一版解说词 / 配音 | 解说生成 `--force-narration`（自动连带重新裁剪+混音） |
 | remix 模式只想换一批评论 | 影评评论 `--force-commentary` |
 | 改了音量 / 原声压低参数 | 混音 `--force-audio-mix`（自动连带重新裁剪） |
 | 全部重来 | `--force` |
 
-每一步也都有 `--skip-<step>`（如 `--skip-asr`），在产物缺失时也不跑该步。完整列表见 `python src/main.py --help`。
+每一步也都有 `--skip-<step>`（如 `--skip-asr`），在产物缺失时也不跑该步。渲染所需的展示配置（字幕、标题、署名等）
+变化会被指纹自动捕捉，一般不需要手动强制。完整列表见 `python src/main.py --help`。
 
 ---
 
@@ -344,18 +354,23 @@ output/<视频名>/
 ├── <视频名>_key_segments.json    # 节拍、标题、解说词/评论
 ├── <视频名>_scene_notes.json     # 画面备注（开启时）
 ├── quality_report.json           # 节拍覆盖等质量指标
+├── .pipeline_state.json          # 裁剪/渲染/画面备注的指纹缓存状态
 ├── descriptions.txt              # 发布标题
 ├── trimmed.mp4                   # 裁剪+混音后的中间文件
 ├── narration/                    # 解说配音 wav
+├── part1/ … partN/               # max_parts > 1 时各子视频（结构同上，文件名带 _partN）
 ├── <视频名>_<标题>_portrait.mp4   # 竖屏成片
 └── <视频名>_<标题>_landscape.mp4  # 横屏成片
 
 data/
 ├── series_background.md          # 剧情背景（自己写）
 ├── cast_roster.json              # 角色表缓存（自动生成）
+├── face_manifest.json            # 人脸标注候选清单（自动生成）
 ├── face_gallery.json             # 人脸库（人脸标注生成）
 └── cast/                         # 角色参考图（人脸标注生成）
-logs/webui/                       # Web 操作台运行日志
+logs/webui/                       # Web 操作台运行日志、人脸/管线历史日志
+logs/webui/upload_tmp/            # 分片上传临时目录（启动时自动清理过期残留）
+output/results/                   # bash collect_results.sh 收集的成片
 ```
 
 ---
@@ -386,6 +401,10 @@ ASR 走云端不占显存；画面备注调小 `scene_notes.batch_size` 或改�
 
 **edge-tts 偶尔卡住**
 微软端点偶发挂死，程序会按 `narration.tts.edge.timeout` 超时重试。频繁失败时可换 `engine: volcano`。
+
+**网页上传视频失败 / 提示「不是有效视频」**
+分片全部上传后会做 `ffprobe` 校验和磁盘剩余空间检查：传错文件（比如把非视频改成了 `.mp4` 后缀）
+或磁盘空间不足都会被拒绝，界面会显示具体原因。残留的分片会话会在 WebUI 启动时按 24 小时超时自动清理。
 
 ---
 
@@ -418,8 +437,14 @@ ASR 走云端不占显存；画面备注调小 `scene_notes.batch_size` 或改�
 │   ├── llm.py                 # OpenAI 兼容客户端
 │   ├── media.py / gpu.py      # ffmpeg 封装 / 编码器探测
 │   ├── episode_utils.py       # 集数解析、背景抽取
-│   └── webui/                 # Gradio Web 操作台
-└── tests/                     # pytest 单元测试
+│   └── webui/
+│       ├── app.py             # Gradio 工作台入口（深色主题、9 步进度条、各标签页）
+│       ├── runner.py          # 管线子进程调度：队列、日志落盘、代理注入、停止
+│       ├── upload.py          # 视频拖拽上传：8MB 分片 + 合并校验 + 过期清理
+│       ├── background.py      # 剧情背景文件的读写 / 备份
+│       ├── status.py          # 剧集列表 / 各阶段产物状态
+│       └── schema.py          # 设置页表单（config_schema.yaml 驱动）与 YAML 回写
+└── tests/                     # pytest 单元测试（LLM 调用已 mock，含上传接口、管线缓存）
 ```
 
 单独调试某个模块：
